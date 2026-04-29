@@ -424,6 +424,122 @@ class TestDispatchMessage(unittest.TestCase):
         self.assertEqual(event.source.user_id, "john@example.com")
         self.assertEqual(event.source.user_name, "John Doe")
         self.assertEqual(event.source.chat_type, "dm")
+        self.assertEqual(event.raw_message, {"uid": b"6"})
+
+
+class TestDispatchRetryHook(unittest.TestCase):
+    """Test retry handling for failed email dispatch lifecycle outcomes."""
+
+    def _make_adapter(self, *, retry_failed_dispatch=True):
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_IMAP_PORT": "993",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            from gateway.platforms.email import EmailAdapter
+            adapter = EmailAdapter(
+                PlatformConfig(
+                    enabled=True,
+                    extra={"retry_failed_dispatch": retry_failed_dispatch},
+                )
+            )
+        return adapter
+
+    def _event(self, adapter, raw_message):
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        source = adapter.build_source(
+            chat_id="user@test.com",
+            chat_type="dm",
+            user_id="user@test.com",
+        )
+        return MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="<msg@test.com>",
+            raw_message=raw_message,
+        )
+
+    def test_success_outcome_does_not_rollback_uid(self):
+        import asyncio
+        from gateway.platforms.base import ProcessingOutcome
+
+        adapter = self._make_adapter()
+        adapter._seen_uids = {b"42"}
+        event = self._event(adapter, {"uid": b"42"})
+
+        with patch.object(adapter, "_mark_uid_unseen") as mark_unseen:
+            asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
+
+        self.assertIn(b"42", adapter._seen_uids)
+        mark_unseen.assert_not_called()
+
+    def test_failure_outcome_removes_seen_uid_and_marks_unread(self):
+        import asyncio
+        from gateway.platforms.base import ProcessingOutcome
+
+        adapter = self._make_adapter()
+        adapter._seen_uids = {b"42"}
+        event = self._event(adapter, {"uid": b"42"})
+        mock_imap = MagicMock()
+        mock_imap.uid.return_value = ("OK", [b""])
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.FAILURE))
+
+        self.assertNotIn(b"42", adapter._seen_uids)
+        mock_imap.uid.assert_called_once_with("store", b"42", "-FLAGS.SILENT", r"(\Seen)")
+        mock_imap.logout.assert_called_once()
+
+    def test_failure_without_uid_is_noop(self):
+        import asyncio
+        from gateway.platforms.base import ProcessingOutcome
+
+        adapter = self._make_adapter()
+        adapter._seen_uids = {b"42"}
+        event = self._event(adapter, {})
+
+        with patch.object(adapter, "_mark_uid_unseen") as mark_unseen:
+            asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.FAILURE))
+
+        self.assertIn(b"42", adapter._seen_uids)
+        mark_unseen.assert_not_called()
+
+    def test_store_failure_is_logged_not_raised(self):
+        import asyncio
+        from gateway.platforms.base import ProcessingOutcome
+
+        adapter = self._make_adapter()
+        adapter._seen_uids = {b"42"}
+        event = self._event(adapter, {"uid": b"42"})
+        mock_imap = MagicMock()
+        mock_imap.uid.return_value = ("NO", [b"store failed"])
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap), \
+             self.assertLogs("gateway.platforms.email", level="WARNING") as logs:
+            asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.FAILURE))
+
+        self.assertNotIn(b"42", adapter._seen_uids)
+        self.assertIn("Failed to mark UID", "\n".join(logs.output))
+        mock_imap.logout.assert_called_once()
+
+    def test_retry_disabled_is_noop(self):
+        import asyncio
+        from gateway.platforms.base import ProcessingOutcome
+
+        adapter = self._make_adapter(retry_failed_dispatch=False)
+        adapter._seen_uids = {b"42"}
+        event = self._event(adapter, {"uid": b"42"})
+
+        with patch.object(adapter, "_mark_uid_unseen") as mark_unseen:
+            asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.FAILURE))
+
+        self.assertIn(b"42", adapter._seen_uids)
+        mark_unseen.assert_not_called()
 
 
 class TestThreadContext(unittest.TestCase):

@@ -37,6 +37,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
     cache_document_from_bytes,
     cache_image_from_bytes,
@@ -64,6 +65,21 @@ MAX_MESSAGE_LENGTH = 50_000
 
 # Supported image extensions for inline detection
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+
+def _coerce_bool_config(value: Any, default: bool = True) -> bool:
+    """Coerce bool-ish platform config values."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+        return default
+    return bool(value)
+
 
 def _is_automated_sender(address: str, headers: dict) -> bool:
     """Return True if this email is from an automated/noreply source."""
@@ -239,6 +255,10 @@ class EmailAdapter(BasePlatformAdapter):
         #       skip_attachments: true
         extra = config.extra or {}
         self._skip_attachments = extra.get("skip_attachments", False)
+        self._retry_failed_dispatch = _coerce_bool_config(
+            extra.get("retry_failed_dispatch"),
+            True,
+        )
 
         # Track message IDs we've already processed to avoid duplicates
         self._seen_uids: set = set()
@@ -455,6 +475,7 @@ class EmailAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             message_id=msg_data["message_id"],
+            raw_message={"uid": msg_data.get("uid")},
             media_urls=media_urls,
             media_types=media_types,
             reply_to_message_id=msg_data["in_reply_to"] or None,
@@ -462,6 +483,38 @@ class EmailAdapter(BasePlatformAdapter):
 
         logger.info("[Email] New message from %s: %s", sender_addr, subject)
         await self.handle_message(event)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Mark failed email dispatches unread so the next UNSEEN poll retries them."""
+        if outcome != ProcessingOutcome.FAILURE or not self._retry_failed_dispatch:
+            return
+
+        raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
+        uid = raw_message.get("uid")
+        if not uid:
+            return
+
+        self._seen_uids.discard(uid)
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, self._mark_uid_unseen, uid)
+        except Exception as e:
+            logger.warning("[Email] Failed to mark UID %r unread for retry: %s", uid, e)
+
+    def _mark_uid_unseen(self, uid: Any) -> None:
+        """Clear the IMAP Seen flag for a UID. Runs in an executor thread."""
+        imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+        try:
+            imap.login(self._address, self._password)
+            imap.select("INBOX")
+            status, data = imap.uid("store", uid, "-FLAGS.SILENT", r"(\Seen)")
+            if status != "OK":
+                raise RuntimeError(f"IMAP UID STORE failed: {status} {data}")
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
 
     async def send(
         self,

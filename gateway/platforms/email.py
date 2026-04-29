@@ -249,10 +249,11 @@ class EmailAdapter(BasePlatformAdapter):
         self._smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
         self._poll_interval = int(os.getenv("EMAIL_POLL_INTERVAL", "15"))
 
-        # Skip attachments — configured via config.yaml:
+        # Email adapter extras — configured via config.yaml:
         #   platforms:
         #     email:
         #       skip_attachments: true
+        #       retry_failed_dispatch: false
         extra = config.extra or {}
         self._skip_attachments = extra.get("skip_attachments", False)
         self._retry_failed_dispatch = _coerce_bool_config(

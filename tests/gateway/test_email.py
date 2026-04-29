@@ -478,6 +478,20 @@ class TestDispatchRetryHook(unittest.TestCase):
         self.assertIn(b"42", adapter._seen_uids)
         mark_unseen.assert_not_called()
 
+    def test_cancelled_outcome_does_not_rollback_uid(self):
+        import asyncio
+        from gateway.platforms.base import ProcessingOutcome
+
+        adapter = self._make_adapter()
+        adapter._seen_uids = {b"42"}
+        event = self._event(adapter, {"uid": b"42"})
+
+        with patch.object(adapter, "_mark_uid_unseen") as mark_unseen:
+            asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED))
+
+        self.assertIn(b"42", adapter._seen_uids)
+        mark_unseen.assert_not_called()
+
     def test_failure_outcome_removes_seen_uid_and_marks_unread(self):
         import asyncio
         from gateway.platforms.base import ProcessingOutcome

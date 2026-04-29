@@ -972,6 +972,35 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] is False  # success should be False
         assert "empty" in call_args[0][2].lower()  # error should mention empty
 
+    def test_tick_delivers_failure_notification_for_empty_success_response(self, tmp_path):
+        """Empty successful final_response must become a failure before delivery."""
+        from cron.scheduler import tick
+
+        job = {
+            "id": "empty-job",
+            "name": "empty-test",
+            "prompt": "do something",
+            "schedule": "every 1h",
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "local",
+            "last_status": None,
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler.run_job", return_value=(True, "output", "", None)), \
+             patch("cron.scheduler._deliver_result", return_value=None) as deliver_mock:
+            tick(verbose=False)
+
+        deliver_mock.assert_called_once()
+        delivered_content = deliver_mock.call_args.args[1]
+        assert "Cron job 'empty-test' failed" in delivered_content
+        assert "empty response" in delivered_content.lower()
+
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
             "id": "test-job",
@@ -1290,6 +1319,14 @@ class TestRunJobSkillBacked:
 
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_tick_lock(self, tmp_path):
+        lock_dir = tmp_path / "cron"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        with patch("cron.scheduler._LOCK_DIR", lock_dir), \
+             patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+            yield
 
     def _make_job(self):
         return {
